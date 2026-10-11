@@ -1,116 +1,112 @@
 import os
 import csv
 import io
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
-)
+import asyncio
+from flask import Flask, request, render_template, send_file
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.types import ChannelParticipantsSearch
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN environment variable.")
+API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+SESSION_STRING = os.environ.get("TELEGRAM_SESSION", "")
 
-HELP_TEXT = (
-    "Main kisi bhi public channel ke saare members ki list nahi nikal sakta. "
-    "Telegram Bot API complete member lists expose nahi karta.\\n\\n"
-    "Main public channel ki basic info check kar sakta hoon, aur jis channel "
-    "mein bot ko permission ho wahan Telegram ke supported count method se "
-    "member count dikhane ki koshish kar sakta hoon."
-)
 
-def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Check Channel", callback_data="check")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
-    ])
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        channel_username = request.form.get("channel", "").strip().replace("@", "")
+        if not channel_username:
+            return render_template("index.html", error="Channel username daalein")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text(
-        "👋 Telegram Channel Helper\\n\\n"
-        "Channel ka @username check karne ke liye button dabao.\\n"
-        "Note: bot saare channel members ke usernames export nahi kar sakta.",
-        reply_markup=menu()
-    )
+        try:
+            members = asyncio.run(fetch_members(channel_username))
+            if not members:
+                return render_template(
+                    "index.html",
+                    error="Koi member nahi mila. Channel public hai? Username sahi hai?"
+                )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "check":
-        context.user_data["awaiting_channel"] = True
-        await query.message.reply_text(
-            "Channel ka public username bhejo, jaise @telegram. "
-            "Sirf public channel ki basic information check hogi."
-        )
-    elif query.data == "help":
-        await query.message.reply_text(HELP_TEXT, reply_markup=menu())
+            csv_data = generate_csv(members)
+            return send_file(
+                io.BytesIO(csv_data.encode("utf-8")),
+                mimetype="text/csv",
+                as_attachment=True,
+                download_name=f"{channel_username}_members.csv",
+            )
+        except Exception as e:
+            return render_template("index.html", error=f"Error: {str(e)}")
 
-async def channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_channel"):
-        await update.message.reply_text("Shuru karne ke liye /start bhejo.")
-        return
+    return render_template("index.html")
 
-    raw = (update.message.text or "").strip()
-    context.user_data["awaiting_channel"] = False
 
-    if raw.startswith("https://t.me/"):
-        raw = raw[len("https://t.me/"):].strip("/")
-    if raw.startswith("@"):
-        raw = raw[1:]
-    if not raw or len(raw) > 64 or not all(c.isalnum() or c == "_" for c in raw):
-        await update.message.reply_text("Username sahi nahi hai. Example: @telegram", reply_markup=menu())
-        return
+async def fetch_members(channel_username):
+    if not SESSION_STRING:
+        raise Exception("TELEGRAM_SESSION env variable set nahi hai")
+
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise Exception("Session invalid hai. Dobara auth karein.")
 
     try:
-        chat = await context.bot.get_chat("@" + raw)
-        title = getattr(chat, "title", None) or getattr(chat, "username", None) or raw
-        username = getattr(chat, "username", None)
-        chat_id = chat.id
-        count_text = "Member count: Telegram ne is bot ko count dene ki permission nahi di."
-        try:
-            count = await context.bot.get_chat_member_count(chat_id)
-            count_text = f"Member count: {count:,}"
-        except Exception:
-            pass
+        entity = await client.get_entity(channel_username)
 
-        result = (
-            "✅ Channel info mil gayi\\n\\n"
-            f"Name: {title}\\n"
-            f"Username: @{username if username else raw}\\n"
-            f"Chat ID: {chat_id}\\n"
-            f"{count_text}\\n\\n"
-            "⚠️ Telegram Bot API kisi bhi channel ke saare members ke usernames "
-            "nahi deta, isliye bulk member-list export available nahi hai."
-        )
-        await update.message.reply_text(result, reply_markup=menu())
-    except Exception as exc:
-        logger.info("Channel lookup failed: %s", type(exc).__name__)
-        await update.message.reply_text(
-            "Channel check nahi ho paya. Username verify karo aur confirm karo ki "
-            "channel public hai. Kuch channels ki information bots ko available nahi hoti.",
-            reply_markup=menu()
-        )
+        members = []
+        offset = 0
+        limit = 200
 
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Menu ke liye /start bhejo.")
+        while True:
+            result = await client(GetParticipantsRequest(
+                channel=entity,
+                filter=ChannelParticipantsSearch(''),
+                offset=offset,
+                limit=limit,
+                hash=0
+            ))
+            if not result.users:
+                break
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, channel_message))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
-    logger.info("Bot is starting")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+            for user in result.users:
+                members.append({
+                    "id": user.id,
+                    "username": user.username or "",
+                    "first_name": user.first_name or "",
+                    "last_name": user.last_name or "",
+                    "phone": user.phone or "Hidden",
+                    "bot": "Yes" if user.bot else "No",
+                    "verified": "Yes" if user.verified else "No",
+                })
+
+            offset += len(result.users)
+            if len(result.users) < limit:
+                break
+            if offset >= 200:
+                break
+
+        return members
+    finally:
+        await client.disconnect()
+
+
+def generate_csv(members):
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["id", "username", "first_name", "last_name", "phone", "bot", "verified"],
+    )
+    writer.writeheader()
+    for m in members:
+        writer.writerow(m)
+    return output.getvalue()
+
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
